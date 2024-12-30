@@ -1,0 +1,434 @@
+---
+title: "quickstat R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*.
+
+```{r}
+suppressPackageStartupMessages({
+    library(arrow)
+    library(duckdb)
+    library(data.table)
+    library(dplyr)
+    library(qs)
+    install.packages("ggvenn", quiet = TRUE)
+    library(ggvenn)
+    library(ggplot2)   
+    library(patchwork)
+})
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+Helper functions
+
+```{r}
+shape <- function(dt) {
+    cat("\nShape: ", ncol(dt), " columns x ",
+    nrow(dt), " rows", sep = "")
+}
+
+fig <- function(width, heigth) {
+    options(repr.plot.width = width, repr.plot.height = heigth)
+}
+```
+
+reading train data
+
+```{r}
+train_meta <- open_dataset("data/train.parquet")
+glimpse(train_meta)
+```
+
+```{r}
+class(train_meta)
+```
+
+```{r}
+con <- dbConnect(duckdb::duckdb())
+dt <- arrow::to_duckdb(train_meta, table_name = "train", con = con)
+dt
+```
+
+```{r}
+dt %>% 
+    group_by(protein_name) %>%
+    summarize(n_mols = n())
+```
+
+```{r}
+dt %>% 
+    group_by(protein_name, binds) %>%
+    summarize(n_mols = n(), .groups = "drop") %>%
+    arrange(protein_name, binds)
+```
+
+```{r}
+train_bb_smiles <- rbindlist(lapply(1:3, function(i) {
+  as.data.table(
+    dbGetQuery(con, paste0(
+      "SELECT DISTINCT(buildingblock", i, "_smiles) AS smiles FROM train"
+      ))
+  )[, BB := i]    
+}))
+train_bb_smiles <- unique(train_bb_smiles)
+```
+
+```{r}
+train_bb_smiles[, .N, by = "BB"]
+```
+
+```{r}
+rm(train_meta, dt) ; g <- gc()
+```
+
+subsetting train data
+
+```{r}
+path <- "data/train subsets"
+tibble(
+  files = list.files(path, recursive = TRUE),
+  size_MB = round(file.size(file.path(path, files)) / 1024^2, 2)
+)
+```
+
+quick stats for the train subset for BRD4
+
+```{r}
+BRD4_dt <- qread("data/train subsets/BRD4_all_bind1_rand_bind0.qs")
+head(BRD4_dt)
+shape(BRD4_dt)
+```
+
+```{r}
+BRD4_dt[, lapply(.SD, uniqueN)]
+```
+
+```{r}
+BRD4_dt[, lapply(.SD, uniqueN), by = "binds"]
+```
+
+```{r}
+venn_diag <- list(
+  buildingblock1 = BRD4_dt[, unique(buildingblock1_smiles)],
+  buildingblock2 = BRD4_dt[, unique(buildingblock2_smiles)],
+  buildingblock3 = BRD4_dt[, unique(buildingblock3_smiles)]
+)
+```
+
+```{r}
+cat("Number of unique patterns in all three building blocks:")
+uniqueN(unlist(venn_diag))
+
+cat("Number of unique patterns per building block:")
+lengths(venn_diag)
+```
+
+```{r}
+fig(25, 10)
+
+ggvenn(venn_diag, show_elements = FALSE, label_sep = "\n",
+       text_size = 6, set_name_size = 8,
+       fill_color = c("#FFCF81", "#99BC85", "#D8B4F8")) +
+  ggtitle(paste("Intersection of building block patterns in the train dataset")) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+```
+
+```{r}
+cols <- names(BRD4_dt)[grepl("smiles", names(BRD4_dt))]
+for(col in cols) {
+  cat("Intersecting", col, ":",
+      nrow(intersect(BRD4_dt[binds == 0, col, with = FALSE],
+                     BRD4_dt[binds == 1, col, with = FALSE])
+      ), "\n")
+}
+```
+
+```{r}
+non_bind_block3 <- 
+  setdiff(BRD4_dt[binds == 0, "buildingblock3_smiles"],
+          BRD4_dt[binds == 1, "buildingblock3_smiles"])
+BRD4_dt[buildingblock3_smiles %chin% unlist(non_bind_block3), .N]
+```
+
+```{r}
+freq_dt <- BRD4_dt[, .N, by = c("buildingblock1_smiles", "binds")]
+freq_dt <- freq_dt[, frequency := N/sum(N)*100, by = "binds"][order(frequency)]
+
+add_row <- freq_dt[1]
+add_row[] <- "..."
+rbindlist(list(head(freq_dt, 5), add_row, tail(freq_dt, 5)))
+```
+
+```{r}
+freq_dt[, .(min_freq = min(frequency),
+            max_freq = max(frequency)),
+        by = "binds"]
+```
+
+```{r}
+ggplot(freq_dt, aes(x = buildingblock1_smiles, y = frequency, fill = factor(binds))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        text = element_text(size = 22),
+        panel.grid.major.x = element_blank()) +
+  scale_fill_manual(values = c("0" = "#FFCF81", "1" = "#01796f")) +
+  ggtitle("Frequency of Building Block 1 Smiles by binding status")
+```
+
+```{r}
+freq_dt <- dcast(freq_dt, buildingblock1_smiles ~ binds, value.var = "frequency")
+freq_dt[, diff := abs(`0` - `1`)]
+```
+
+```{r}
+nrow(freq_dt[diff >= 3 * pmin(`0`, `1`)])
+```
+
+```{r}
+freq_dt <- BRD4_dt[, .N, by = c("buildingblock2_smiles", "binds")]
+freq_dt <- freq_dt[, frequency := N/sum(N)*100, by = "binds"][order(frequency)]
+
+add_row <- freq_dt[1]
+add_row[] <- "..."
+rbindlist(list(head(freq_dt, 5), add_row, tail(freq_dt, 5)))
+```
+
+```{r}
+freq_dt[, .(min_freq = min(frequency),
+            max_freq = max(frequency)),
+        by = "binds"]
+```
+
+```{r}
+ggplot(freq_dt, aes(x = buildingblock2_smiles, y = frequency, fill = factor(binds))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        text = element_text(size = 22),
+        panel.grid.major.x = element_blank()) +
+  scale_fill_manual(values = c("0" = "#FFCF81", "1" = "#01796f")) +
+  ggtitle("Frequency of Building Block 2 Smiles by binding status")
+```
+
+```{r}
+freq_dt <- dcast(freq_dt, buildingblock2_smiles ~ binds, value.var = "frequency")
+freq_dt[, diff := abs(`0` - `1`)]
+```
+
+```{r}
+nrow(freq_dt[diff >= 3 * pmin(`0`, `1`)])
+```
+
+```{r}
+freq_dt <- BRD4_dt[, .N, by = c("buildingblock3_smiles", "binds")]
+freq_dt <- freq_dt[, frequency := N/sum(N)*100, by = "binds"][order(frequency)]
+add_row <- freq_dt[1]
+add_row[] <- "..."
+rbindlist(list(head(freq_dt, 5), add_row, tail(freq_dt, 5)))
+```
+
+```{r}
+freq_dt[, .(min_freq = min(frequency),
+            max_freq = max(frequency)),
+        by = "binds"]
+```
+
+```{r}
+ggplot(freq_dt, aes(x = buildingblock3_smiles, y = frequency, fill = factor(binds))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        text = element_text(size = 22),
+        panel.grid.major.x = element_blank()) +
+  scale_fill_manual(values = c("0" = "#FFCF81", "1" = "#01796f")) +
+  ggtitle("Frequency of Building Block 3 Smiles by binding status")
+```
+
+```{r}
+freq_dt <- dcast(freq_dt, buildingblock3_smiles ~ binds, value.var = "frequency")
+freq_dt[, diff := abs(`0` - `1`)]
+```
+
+```{r}
+nrow(freq_dt[diff >= 3 * pmin(`0`, `1`)])
+```
+
+test data
+
+```{r}
+test_dt <- fread("data/test.csv")
+head(test_dt)
+shape(test_dt)
+```
+
+```{r}
+test_bb_smiles <- rbindlist(list(
+  test_dt[, .(smiles = unique(buildingblock1_smiles), BB = 1)],
+  test_dt[, .(smiles = unique(buildingblock2_smiles), BB = 2)],
+  test_dt[, .(smiles = unique(buildingblock3_smiles), BB = 3)]
+))
+nrow(test_bb_smiles)
+```
+
+```{r}
+cat("Number of overlapping SMILES in train and test sets")
+length(intersect(unique(train_bb_smiles$smiles), unique(test_bb_smiles$smiles)))
+```
+
+```{r}
+bb_smiles <- rbindlist(list(
+  train_bb_smiles[, set := "train"],
+  test_bb_smiles[, set := "test"]
+))
+
+```
+
+```{r}
+bb_smiles_counts <- copy(bb_smiles)
+
+invisible(lapply(1:3, function(i) {
+  
+  train_data <-  bb_smiles_counts[BB == i & set == "train"]
+  test_data <-  bb_smiles_counts[BB == i & set == "test"]
+  
+  bb_smiles_counts[BB == i, new_in_test := length(
+    setdiff(test_data$smiles, train_data$smiles)
+  )]
+  bb_smiles_counts[BB == i, new_in_train := length(
+    setdiff(train_data$smiles, test_data$smiles)
+  )]
+  bb_smiles_counts[BB == i, common := length(
+    intersect(train_data$smiles, test_data$smiles)
+  )]
+}))
+
+bb_smiles_counts <- 
+  bb_smiles_counts[, .N, by = c("set", "BB", "common", "new_in_test", "new_in_train")]
+bb_smiles_counts <- dcast(bb_smiles_counts, ... ~ set, value.var = "N")
+setcolorder(bb_smiles_counts, c("BB", "train", "test", "common", "new_in_test", "new_in_train"))
+
+bb_smiles_counts
+```
+
+```{r}
+nrow(test_dt[ ! (
+  buildingblock1_smiles %in% bb_smiles[set == "train", unique(smiles)] |
+    buildingblock2_smiles %in% bb_smiles[set == "train", unique(smiles)] |
+    buildingblock3_smiles %in% bb_smiles[set == "train", unique(smiles)]
+)] 
+)
+```
+
+```{r}
+fwrite(bb_smiles, "all_bb_smiles_by_bb.csv")
+```
+
+```{r}
+venn_diag <- lapply(1:3, function(bb) {
+  list(
+    "Test" = test_bb_smiles[BB == bb, unique(smiles)],
+    "Train" = train_bb_smiles[BB == bb, unique(smiles)]
+  )
+})
+names(venn_diag) <- c("buildingblock1_smiles",
+                      "buildingblock2_smiles",
+                      "buildingblock3_smiles")
+```
+
+```{r}
+str(venn_diag)
+```
+
+```{r}
+cat("Number of unique patterns in train and test three building blocks:")
+lapply(venn_diag, function(l) uniqueN(unlist(l)))
+
+cat("Number of unique patterns per set:")
+lapply(venn_diag, lengths)
+```
+
+```{r}
+fig(25, 10)
+ggvenn_lst <- list()
+
+for(bb in names(venn_diag)) {
+  
+  ggvenn_lst[[bb]] <- ggvenn(venn_diag[[bb]], show_elements = FALSE, label_sep = "\n",
+                             text_size = 6, set_name_size = 8,
+                             fill_color = c("#FFCF81", "#99BC85")) +
+    ggtitle(bb) +
+    theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+}
+ggvenn_lst[["buildingblock1_smiles"]] +
+  ggvenn_lst[["buildingblock2_smiles"]] +
+  ggvenn_lst[["buildingblock3_smiles"]] + plot_annotation(
+    title = "Intersection of building block patterns in the test and train datasets") & 
+  theme(text = element_text(size = 22) )
+```
+
+```{r}
+test_dt[, lapply(.SD, uniqueN)]
+```
+
+```{r}
+cat("Proteins in the test set")
+test_dt[, unique(protein_name)]
+```
+
+```{r}
+table(test_dt[, .N, by = "molecule_smiles"][, .(N)])
+```
+
+```{r}
+test_dt[, .N, by = "protein_name"]
+```
+
+```{r}
+proteins <- test_dt[, unique(protein_name)]
+venn_diag <- lapply(proteins, function(prot) {
+  
+  prot_dt <- test_dt[protein_name == prot]
+  list(
+    buildingblock1 = prot_dt[, unique(buildingblock1_smiles)],
+    buildingblock2 = prot_dt[, unique(buildingblock2_smiles)],
+    buildingblock3 = prot_dt[, unique(buildingblock3_smiles)]
+  )    
+})
+names(venn_diag) <- proteins
+```
+
+```{r}
+str(venn_diag)
+```
+
+```{r}
+cat("Number of unique patterns in all three building blocks:")
+lapply(venn_diag, function(l) uniqueN(unlist(l)))
+
+cat("Number of unique patterns per building block:")
+lapply(venn_diag, lengths)
+```
+
+```{r}
+fig(25, 10)
+ggvenn_lst <- list()
+
+for(p in proteins) {
+  
+  ggvenn_lst[[p]] <- ggvenn(venn_diag[[p]], show_elements = FALSE, label_sep = "\n",
+                            text_size = 6, set_name_size = 8,
+                            fill_color = c("#FFCF81", "#99BC85", "#D8B4F8")) +
+    ggtitle(p) +
+    theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+}
+ggvenn_lst[["BRD4"]] + ggvenn_lst[["HSA"]] + ggvenn_lst[["sEH"]]+ plot_annotation(
+  title = "Intersection of building block patterns in the test dataset") & 
+  theme(text = element_text(size = 22) )
+```

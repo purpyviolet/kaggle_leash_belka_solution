@@ -1,0 +1,410 @@
+---
+title: "feature engineering Notebook"
+output: html_notebook
+---
+
+```{r}
+suppressMessages({    
+    if (!requireNamespace("BiocManager", quietly=TRUE))
+         install.packages("BiocManager")
+    BiocManager::install("ChemmineR", update = FALSE, quiet = TRUE)
+    BiocManager::install("fmcsR", update = FALSE, quiet = TRUE) 
+    library(ChemmineR)
+    library(fmcsR)
+    library(data.table)
+    library(qs)
+    library(foreach)
+    library(pheatmap)
+    library(ggplot2)
+})
+
+```
+
+```{r}
+shape <- function(dt) {
+    cat("\nShape: ", ncol(dt), " columns x ",
+    nrow(dt), " rows", sep = "")
+}
+
+fig <- function(width, heigth) {
+    options(repr.plot.width = width, repr.plot.height = heigth)
+}
+```
+
+```{r}
+bb_smiles <- fread("data/smiles/all_bb_smiles_by_bb.csv")
+bb_smiles[, .N, by = c("set", "BB")]
+```
+
+```{r}
+bb_smiles_agg <- bb_smiles[
+    , .(BB = paste(unique(BB), collapse = ", "),
+        set = paste(unique(set), collapse = "/")),
+    by = "smiles"]
+
+bb_smiles_agg[, .N, by = c("BB", "set")][order(BB)]
+```
+
+```{r}
+bb_smiles_sdfset <- read.SDFset("data/smiles/bb_smiles_sdfset.sdf")
+bb_smiles_sdfset
+
+cat("\nSingle molecule from SDFset:\n")
+as(bb_smiles_sdfset[[1]], "list")
+```
+
+```{r}
+# sdf.visualize(bb_smiles_sdfset[1:5])
+```
+
+```{r}
+smiles_dict <- data.table(
+    smiles = sapply(1:length(bb_smiles_sdfset), function(i) {
+        bb_smiles_sdfset[[i]]@header["Molecule_Name"]
+        }),
+    id = cid(bb_smiles_sdfset)
+)
+head(smiles_dict)
+```
+
+```{r}
+mol_features <- data.table(
+    SMILES = smiles_dict$smiles,
+    MF = MF(bb_smiles_sdfset, addH = TRUE),
+    MW = MW(bb_smiles_sdfset, addH = TRUE),
+    Ncharges = sapply(bonds(bb_smiles_sdfset, type = "charge"), length),
+    atomcountMA(bb_smiles_sdfset, addH = TRUE),
+    groups(bb_smiles_sdfset, type = "countMA"),
+    rings(bb_smiles_sdfset, type = "count", arom = "TRUE"))
+
+head(mol_features)
+shape(mol_features)
+```
+
+```{r}
+names(mol_features)
+```
+
+```{r}
+mol_num <- 2
+ringatoms <- rings(bb_smiles_sdfset[mol_num], type="all")
+
+fig(10, 10)
+atomindex <- as.numeric(gsub(".*_", "", unique(unlist(ringatoms))))
+plot(bb_smiles_sdfset[mol_num], print = FALSE, colbonds = atomindex)
+```
+
+```{r}
+ringatoms <- rings(bb_smiles_sdfset[mol_num], type = "count", arom = "TRUE")
+ringatoms
+```
+
+```{r}
+fig(20, 10)
+cols = c('C', 'H', 'N', 'O', 'Cl', 'S', 'F', 'Br', 'I', 'B', 'Si')
+boxplot(mol_features[, ..cols], col = "#99BC85",
+        main = "Atom Frequency in the building blocks SMILES",
+        cex.main = 1.5, cex.axis = 1.5)
+```
+
+```{r}
+fig(25, 10)
+cols = c('RNH2', 'R2NH', 'R3N', 'ROPO3', 'ROH', 'RCHO',
+         'RCOR', 'RCOOH', 'RCOOR', 'ROR', 'RCCH', 'RCN',
+        'RINGS', 'AROMATIC')
+boxplot(mol_features[, ..cols], col = "#99BC85",
+        main = "Frequency of functional groups, rings, and aromatic rings in the building blocks SMILES",
+       cex.main = 1.5, cex.axis = 1.5)
+```
+
+```{r}
+cols <- names(colSums(mol_features[, !c("MF", "SMILES")]))[
+    colSums(mol_features[, !c("MF", "SMILES")]) == 0]
+mol_features <- mol_features[, !cols, with = FALSE]
+```
+
+```{r}
+fig(10, 10)
+boxplot(mol_features[, MW], col = "#99BC85",
+        main = "Molecular weight of the building blocks SMILES",
+       cex.main = 1.5, cex.axis = 1.5)
+```
+
+```{r}
+fwrite(mol_features, "bb_mol_phys_chem_features.csv")
+```
+
+```{r}
+apset <- sdf2ap(bb_smiles_sdfset)
+view(apset[1:3])
+```
+
+```{r}
+any(cmp.duplicated(apset, type = 1))
+```
+
+```{r}
+dup <- cmp.duplicated(apset)
+cat("Found", length(cid(apset[dup])), "duplicated instances:")
+cid(apset[dup])
+```
+
+```{r}
+dup_clust_dt <- as.data.table(cmp.duplicated(apset, type = 2))
+cat("Duplicates forming a cluster of 3 or more molecules:")
+dup_clust_dt[CLSZ_100 >= 3 ][order(CLID_100)]
+```
+
+```{r}
+fig(25, 15)
+plot(bb_smiles_sdfset[c("CMP68", "CMP133", "CMP210")], print = FALSE)
+```
+
+```{r}
+smiles_dict[c(133, 68, 210)]
+```
+
+```{r}
+msc_test <- fmcs(bb_smiles_sdfset[2], bb_smiles_sdfset[2110])
+msc_test
+cat("MCS shared among two molecules:")
+
+fig(25, 10)
+plotMCS(msc_test)
+```
+
+```{r}
+msc_test[["stats"]]["Tanimoto_Coefficient"]
+```
+
+```{r}
+calculate_similarity <- function(sdfset, measure) {
+    
+    num_cores <- detectCores()
+    registerDoParallel(cores = detectCores())
+
+    n_mols <- length(sdfset)
+    sdfset_list <- lapply(seq(n_mols-1), function(i) sdfset[i:n_mols])
+    
+    res_lst <- foreach(batch = sdfset_list, .packages = c("fmcsR")) %dopar% {
+        res <- sapply(2:length(batch), function(i) fmcs(batch[1], batch[i])[["stats"]][measure])
+        res <- c(rep(0, n_mols - length(res)), res)
+        }
+    res <- c(unlist(res_lst), rep(0, n_mols))
+    similarity_matrix <- matrix(res, nrow = n_mols, ncol = n_mols, byrow = TRUE)   
+    similarity_matrix[lower.tri(similarity_matrix)] <- 
+                      t(similarity_matrix)[lower.tri(similarity_matrix)]
+    diag(similarity_matrix) <- 1
+    return(similarity_matrix)
+}
+```
+
+```{r}
+# library(doParallel)
+
+# tictoc::tic()
+# tam_sim_fmcs <- calculate_similarity(bb_smiles_sdfset, measure = "Tanimoto_Coefficient")
+# rownames(tam_sim_fmcs) <- cid(bb_smiles_sdfset)
+# colnames(tam_sim_fmcs) <- cid(bb_smiles_sdfset)
+# tictoc::toc()
+# ~ 3.5h in kaggle :(
+tam_sim_fmcs <- qread("data/features/tam_sim_fmcs_bb_smiles.qs")
+
+hc <- hclust(as.dist(1-tam_sim_fmcs), method = "single")
+head(tam_sim_fmcs)
+```
+
+```{r}
+palette_len = 10
+breaks <- c(    
+    seq(min(tam_sim_fmcs), 0, length.out = ceiling(palette_len/2) + 1),
+    seq(max(tam_sim_fmcs)/palette_len, max(tam_sim_fmcs), length.out = floor(palette_len/2))
+)
+colors <- colorRampPalette(c("darkblue", "white","darkred"))(palette_len)
+
+fig(30, 25)
+heat <- pheatmap(tam_sim_fmcs, fontsize = 16,
+                 color = colors,
+                 breaks = breaks,
+                 angle_col = 90,
+                 show_rownames = FALSE,
+                 show_colnames = FALSE,
+                 cluster_cols = hc,
+                 cluster_rows = FALSE,
+                 main = paste("Similarity using Tanimoto coefficient based on FMCS for building blocks molecules"))
+```
+
+```{r}
+cat("The number of molecules per cluster (at the level shown by the red line)")
+
+cut_heigh = 0.34
+# table(sort(cutree(heat$tree_col, h = cut_heigh)))
+
+fig(30, 20)
+plot(heat$tree_col)
+abline(h = cut_heigh, col = "red", lty = 3, lwd = 1)
+```
+
+```{r}
+clust <- cutree(heat$tree_col, h = cut_heigh)
+mol_features <- data.table("smiles_id" = cid(bb_smiles_sdfset),
+                           "smiles" = smiles_dict$smiles,
+                           "Tanimoto_FMCS_cl" = clust)
+table(mol_features$Tanimoto_FMCS_cl)[table(mol_features$Tanimoto_FMCS_cl) > 5]
+```
+
+```{r}
+mol_features <- unique(bb_smiles[, !"set"])[mol_features, on = "smiles"]
+mol_features <- unique(mol_features[, BBs := paste(BB, collapse = ", "), by = "smiles"][, !"BB"])
+```
+
+```{r}
+mol_features[
+    , .(n_clusters = uniqueN(Tanimoto_FMCS_cl)),
+    by = c("BBs")]
+```
+
+```{r}
+pca <- prcomp(tam_sim_fmcs, center = TRUE, scale = TRUE)  
+plt_dt <- data.table(id = rownames(pca$x),
+                     pca$x[, 1:2])
+plt_dt <- plt_dt[smiles_dict, on = "id"][bb_smiles_agg, on = "smiles"]
+```
+
+```{r}
+ggplot(plt_dt, aes(x = PC1, y = PC2, color = BB)) +
+    geom_point(size = 3) +
+    theme_bw(base_size = 22) +
+    theme(panel.grid = element_blank()) + #,aspect.ratio = 1
+    ggtitle("PCA of Tanimoto coefficients based on FMCS for building blocks molecules")
+```
+
+```{r}
+ggplot(plt_dt, aes(x = PC1, y = PC2, color = set)) +
+    geom_point(size = 3) +
+    theme_bw(base_size = 22) +
+    theme(panel.grid = element_blank()) + #,aspect.ratio = 1
+    ggtitle("PCA of Tanimoto coefficients based on FMCS for building blocks molecules")
+```
+
+```{r}
+fpset <- desc2fp(apset)
+fpset
+view(fpset[1:2])
+```
+
+```{r}
+fpSim(fpset[1], fpset[2], method = "Tanimoto") # default method
+```
+
+```{r}
+tam_sim_ap <- sapply(cid(fpset), function(x) fpSim(x = fpset[x], fpset, sorted = FALSE)) 
+hc <- hclust(as.dist(1 - tam_sim_ap), method = "single")
+head(tam_sim_ap)
+```
+
+```{r}
+palette_len = 10
+breaks <- c(    
+    seq(min(tam_sim_ap), 0, length.out = ceiling(palette_len/2) + 1),
+    seq(max(tam_sim_ap)/palette_len, max(tam_sim_ap), length.out = floor(palette_len/2))
+)
+colors <- colorRampPalette(c("darkblue", "white","darkred"))(palette_len)
+
+fig(30, 25)
+heat <- pheatmap(tam_sim_ap, fontsize = 16,
+                 color = colors,
+                 breaks = breaks,
+                 angle_col = 90,
+                 show_rownames = FALSE,
+                 show_colnames = FALSE,
+                 cluster_cols = hc,
+                 cluster_rows = FALSE,
+                 main = paste("Similarity using Tanimoto coefficient based on atom pair fingerprints for building blocks molecules"))
+```
+
+```{r}
+cat("The number of molecules per cluster (at the level shown by the red line)")
+
+cut_heigh = 0.315
+# table(sort(cutree(heat$tree_col, h = cut_heigh)))
+
+fig(30, 20)
+plot(heat$tree_col)
+abline(h = cut_heigh, col = "red", lty = 3, lwd = 1)
+```
+
+```{r}
+clust <- cutree(heat$tree_col, h = cut_heigh)
+mol_features <- data.table("smiles_id" = cid(bb_smiles_sdfset),
+                           "smiles" = smiles_dict$smiles,
+                           "Tanimoto_AP_cl" = clust)
+table(mol_features$Tanimoto_AP_cl)[table(mol_features$Tanimoto_AP_cl) > 5]
+```
+
+```{r}
+mol_features <- unique(bb_smiles[, !"set"])[mol_features, on = "smiles"]
+mol_features <- unique(mol_features[, BBs := paste(BB, collapse = ", "), by = "smiles"][, !"BB"])
+```
+
+```{r}
+mol_features[
+    , .(n_clusters = uniqueN(Tanimoto_AP_cl)),
+    by = c("BBs")]
+```
+
+```{r}
+pca <- prcomp(tam_sim_ap, center = TRUE, scale = TRUE)  
+plt_dt <- data.table(id = rownames(pca$x),
+                     pca$x[, 1:2])
+plt_dt <- plt_dt[smiles_dict, on = "id"][bb_smiles_agg, on = "smiles"]
+```
+
+```{r}
+ggplot(plt_dt, aes(x = PC1, y = PC2, color = BB)) +
+    geom_point(size = 3) +
+    theme_bw(base_size = 22) +
+    theme(panel.grid = element_blank()) + #,aspect.ratio = 1
+    ggtitle("PCA of Tanimoto coefficient based on atom pair fingerprints for building blocks molecules")
+```
+
+```{r}
+ggplot(plt_dt, aes(x = PC1, y = PC2, color = set)) +
+    geom_point(size = 3) +
+    theme_bw(base_size = 22) +
+    theme(panel.grid = element_blank()) + #,aspect.ratio = 1
+    ggtitle("PCA of Tanimoto coefficients based on FMCS for building blocks molecules")
+```
+
+```{r}
+tam_apfp_dt <- as.data.table(as.matrix(fpset))
+names(tam_apfp_dt) <- paste("f", 1:ncol(tam_apfp_dt))
+tam_apfp_dt <- cbind("SMILES" = smiles_dict$smiles, tam_apfp_dt)
+head(tam_apfp_dt)
+shape(tam_apfp_dt)
+```
+
+```{r}
+fwrite(tam_apfp_dt, "bb_mol_apfp_features.csv")
+```
+
+```{r}
+clusters <- cmp.cluster(db = apset, cutoff = c(0.5, 0.6, 0.7), quiet = TRUE)
+head(clusters)
+```
+
+```{r}
+cluster.sizestat(clusters, cluster.result = 1)
+```
+
+```{r}
+cluster.sizestat(clusters, cluster.result = 3)
+```
+
+```{r}
+cluster.visualize(apset, clusters, size.cutoff = 1, quiet = TRUE, cluster.result = 1)
+```
+
+```{r}
+
+```
